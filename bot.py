@@ -5,8 +5,9 @@ import time
 import random
 import requests
 from colorama import *
-from websocket import WebSocket,_exceptions
+from websocket import WebSocket, _exceptions
 from datetime import datetime
+from retrying import retry
 
 init(autoreset=True)
 
@@ -39,6 +40,7 @@ class PrickTod:
         now = datetime.now().isoformat(" ").split(".")[0]
         print(f"{hitam}[{now}]{reset} {message}")
 
+    @retry(wait_fixed=2000, stop_max_attempt_number=5)
     def active_refill_energy(self, id, ua):
         url = "https://api.prick.lol/v1/boost/energy-regeneration"
         headers = {
@@ -48,11 +50,13 @@ class PrickTod:
             "X-Requested-With": "org.telegram.messenger",
         }
         res = requests.put(url, headers=headers)
+        res.raise_for_status()
         open(".http_logs.log", "a").write(res.text + "\n")
         free_refill_left = res.json()["result"]["freeEnergyRegeneration"]
         refill_energy = res.json()["result"]["energy"]
         return refill_energy, free_refill_left
 
+    @retry(wait_fixed=2000, stop_max_attempt_number=5)
     def active_turbo(self, id, ua):
         url = "https://api.prick.lol/v1/boost/turbo"
         headers = {
@@ -62,11 +66,22 @@ class PrickTod:
             "X-Requested-With": "org.telegram.messenger",
         }
         res = requests.put(url, headers=headers)
+        res.raise_for_status()
         open(".http_logs.log", "a").write(res.text + "\n")
         end_free_turbo = res.json()["result"]["turboEndedAt"].replace("Z", "")
         free_turbo_left = res.json()["result"]["freeTurbo"]
         end_format = round(datetime.fromisoformat(end_free_turbo).timestamp())
         return free_turbo_left, end_format
+
+    @retry(wait_fixed=2000, stop_max_attempt_number=5)
+    def connect_ws(self, headers):
+        ws = WebSocket()
+        ws.connect("wss://api.prick.lol/ws", header=headers)
+        return ws
+
+    @retry(wait_fixed=2000, stop_max_attempt_number=5)
+    def recv_ws(self, ws):
+        return ws.recv()
 
     def game(self, id):
         list_useragent = [
@@ -88,15 +103,23 @@ class PrickTod:
             "User-Agent": user_agent,
             "Sec-WebSocket-Protocol": str(id),
         }
-        ws = WebSocket()
-        ws.connect("wss://api.prick.lol/ws", header=headers)
-        self.log(f"{hijau}connect to wss server !")
-        for i in range(2):
-            res = ws.recv()
-            if "data" in json.loads(res).keys():
-                break
-            
-        open(".wss_logs.log", "a",encoding="utf-8").write(res + "\n")
+        try:
+            ws = self.connect_ws(headers)
+            self.log(f"{hijau}connect to wss server !")
+        except _exceptions.WebSocketException as e:
+            self.log(f"{merah}WebSocket connection error: {str(e)}")
+            return
+
+        try:
+            for i in range(2):
+                res = self.recv_ws(ws)
+                if "data" in json.loads(res).keys():
+                    break
+        except _exceptions.WebSocketException as e:
+            self.log(f"{merah}Error during WebSocket communication: {str(e)}")
+            return
+
+        open(".wss_logs.log", "a", encoding="utf-8").write(res + "\n")
         if '"action":null' in res:
             self.log(f"{merah}id is invalid !")
             return
@@ -125,6 +148,8 @@ class PrickTod:
             if free_turbo > 0:
                 if is_turbo is False:
                     free_turbo, end_turbo = self.active_turbo(id, user_agent)
+                    if free_turbo is None:
+                        return
                     self.log(f"{hijau}active turbo successfully !")
                     start_turbo = int(time.time())
                     is_turbo = True
@@ -140,34 +165,40 @@ class PrickTod:
             list_taps = [round(time.time() * 1000) for _ in range(taps)]
             data = {"action": "tap", "data": list_taps}
             try:
-               ws.send(json.dumps(data))
+                ws.send(json.dumps(data))
             except _exceptions.WebSocketConnectionClosedException:
-                self.log(f'{merah}connection clonse !')
+                self.log(f'{merah}connection closed !')
                 return False
-            
-            for i in range(2):
-                res = ws.recv()
-                open(".wss_logs.log", "a",encoding="utf-8").write(res + "\n")
-                data_res = json.loads(res)
-                if data_res["action"] == "energy_recovery":
-                    _energy = data_res["energy"]
-                    self.log(f"{hijau}energy {putih}+{_energy}")
-                    continue
 
-                if data_res["action"] == "result-tap":
-                    balance = data_res["balance"]
-                    energy = data_res["energy"]
-                    self.log(f"{hijau}taps : {putih}{taps}")
-                    self.log(f"{hijau}balance : {putih}{balance}")
-                    self.log(f"{hijau}energy remaining : {putih}{energy}")
-                    if is_turbo:
-                        self.countdown(3)
-                    else:
-                        self.countdown(10)
-                    break
+            try:
+                for i in range(2):
+                    res = self.recv_ws(ws)
+                    open(".wss_logs.log", "a", encoding="utf-8").write(res + "\n")
+                    data_res = json.loads(res)
+                    if data_res["action"] == "energy_recovery":
+                        _energy = data_res["energy"]
+                        self.log(f"{hijau}energy {putih}+{_energy}")
+                        continue
+
+                    if data_res["action"] == "result-tap":
+                        balance = data_res["balance"]
+                        energy = data_res["energy"]
+                        self.log(f"{hijau}taps : {putih}{taps}")
+                        self.log(f"{hijau}balance : {putih}{balance}")
+                        self.log(f"{hijau}energy remaining : {putih}{energy}")
+                        if is_turbo:
+                            self.countdown(3)
+                        else:
+                            self.countdown(10)
+                        break
+            except _exceptions.WebSocketException as e:
+                self.log(f"{merah}Error during WebSocket communication: {str(e)}")
+                return
 
             if energy <= 100 and free_energy_refill > 0:
                 energy, free_energy_refill = self.active_refill_energy(id, user_agent)
+                if energy is None:
+                    return
                 self.log(f"{hijau}refill energy successfully !")
                 continue
 
@@ -183,7 +214,15 @@ class PrickTod:
             os.system("cls" if os.name == "nt" else "clear")
         print(banner)
 
-        ids = open("id.txt", "r").read().splitlines()
+        try:
+            ids = open("id.txt", "r").read().splitlines()
+        except FileNotFoundError:
+            self.log(f"{merah}Error: id.txt file not found.")
+            sys.exit(1)
+        except Exception as e:
+            self.log(f"{merah}Error: {str(e)}")
+            sys.exit(1)
+
         self.log(f"{hijau}account detected : {putih}{len(ids)}")
         print(f"{putih}~" * 50)
         while True:
@@ -212,3 +251,6 @@ if __name__ == "__main__":
         app.main()
     except KeyboardInterrupt:
         sys.exit()
+    except Exception as e:
+        print(f"{merah}Unexpected error: {str(e)}")
+        sys.exit(1)
